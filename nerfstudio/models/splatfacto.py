@@ -166,6 +166,8 @@ class SplatfactoModelConfig(ModelConfig):
     """Regularization term for opacity in MCMC strategy. Only enabled when using MCMC strategy"""
     mcmc_scale_reg: float = 0.01
     """Regularization term for scale in MCMC strategy. Only enabled when using MCMC strategy"""
+    depth_loss_mult: float = 1e-3
+    """Lambda of depth supervision loss. Set > 0 to enable depth constraint during training."""
 
 
 class SplatfactoModel(Model):
@@ -541,7 +543,7 @@ class SplatfactoModel(Model):
         if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        if self.config.output_depth_during_training or not self.training:
+        if self.config.output_depth_during_training or (self.training and self.config.depth_loss_mult > 0.0) or not self.training:
             render_mode = "RGB+ED"
         else:
             render_mode = "RGB"
@@ -706,6 +708,23 @@ class SplatfactoModel(Model):
             self.camera_optimizer.get_loss_dict(loss_dict)
             if self.config.use_bilateral_grid:
                 loss_dict["tv_loss"] = 10 * total_variation_loss(self.bil_grids.grids)
+
+            # Depth supervision, following the depth_nerfacto style of an optional weighted depth term.
+            if self.config.depth_loss_mult > 0.0 and "depth_image" in batch and outputs["depth"] is not None:
+                gt_depth = self._downscale_if_required(batch["depth_image"]).to(self.device)
+                pred_depth = outputs["depth"]
+
+                # Ensure both tensors are [H, W, 1] for consistent masking and reduction.
+                if gt_depth.ndim == 2:
+                    gt_depth = gt_depth.unsqueeze(-1)
+                if pred_depth.ndim == 2:
+                    pred_depth = pred_depth.unsqueeze(-1)
+
+                assert gt_depth.shape[:2] == pred_depth.shape[:2]
+                valid_mask = gt_depth > 0
+                if torch.any(valid_mask):
+                    depth_loss = torch.abs(pred_depth - gt_depth)[valid_mask].mean()
+                    loss_dict["depth_loss"] = self.config.depth_loss_mult * depth_loss
 
         return loss_dict
 
